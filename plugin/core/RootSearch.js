@@ -1,17 +1,12 @@
-// Root search assembly (SPEC §7): candidates from each provider, metadata
-// (alias, favourites, frecency), sections, and the actions each row offers.
-// Ranking itself is Ranker.js; frecency maths is Frecency.js. Both are passed
-// in as `deps` because a core module never imports another (QML + node).
 
-var SUGGESTIONS_LIMIT = 6            // [I] SPEC §7.2 "N≈6"
+var SUGGESTIONS_LIMIT = 6
 
-// Fallback commands, in default fallback order [O names, D URLs].
 var FALLBACKS = [
   { id: "fallback:google", title: "Search Google", icon: "", url: "https://www.google.com/search?q={query}" },
-  { id: "fallback:duckduckgo", title: "Search DuckDuckGo", icon: "", url: "https://duckduckgo.com/?q={query}" }
+  { id: "fallback:duckduckgo", title: "Search DuckDuckGo", icon: "", url: "https://duckduckgo.com/?q={query}" },
+  { id: "fallback:agent", title: "Ask default agent", icon: "󰚩", subtitle: "New terminal session · Ctrl+Alt+Enter" }
 ]
 
-// Built-in commands of our own (the declarative catalog; grows per phase).
 var BUILTINS = [
   {
     id: "builtin:omarchy-menu",
@@ -19,6 +14,15 @@ var BUILTINS = [
     subtitle: "Open the original Omarchy menu",
     keywords: ["menu", "omarchy"],
     run: { summon: "omarchy.menu", payload: "{\"menu\":\"root\"}" },
+    rootSearch: { when: "always" }
+  },
+  {
+    id: "builtin:calculator-history",
+    title: "Calculator History",
+    subtitle: "Calculator",
+    glyph: "\uf1da",                     // nf-fa-history
+    keywords: ["calculator", "calc", "math", "history", "conversions"],
+    run: { push: { kind: "calculator-history", title: "Calculator History" } },
     rootSearch: { when: "always" }
   }
 ]
@@ -41,7 +45,7 @@ function appCandidate(entry) {
     title: String(entry.name || desktopId),
     subtitle: "",
     keywords: keywords,
-    bundleId: desktopId,               // matched only for queries with "." [O]
+    bundleId: desktopId,
     typeLabel: "Application",
     appId: desktopId,
     iconName: String(entry.icon || ""),
@@ -49,8 +53,6 @@ function appCandidate(entry) {
   }
 }
 
-// One Omarchy menu item. Top-level menus show on the empty root ("Commands");
-// deeper items only while searching, or the root would list ~400 rows.
 function menuCandidate(tree, item, guards, deps) {
   var crumbs = deps.OmarchyMenu.breadcrumb(tree, item.id)
   var keywords = item.aliases.map(words).filter(function(k) { return k })
@@ -85,15 +87,13 @@ function builtinCandidate(def) {
     subtitle: def.subtitle || "",
     keywords: def.keywords || [],
     typeLabel: "Command",
-    glyph: "",
-    glyphFont: "omarchy",
+    glyph: def.glyph || "",
+    glyphFont: def.glyph ? "" : "omarchy",
     run: def.run,
     rootSearch: def.rootSearch || { when: "always" }
   }
 }
 
-// All Omarchy rows that are visible under the current guard answers, plus
-// rows from runtime providers (fonts, power profiles).
 function menuCandidates(tree, guards, providerItems, deps) {
   var out = []
   for (var i = 0; i < tree.order.length; i++) {
@@ -115,7 +115,6 @@ function menuCandidates(tree, guards, providerItems, deps) {
   return out
 }
 
-// Attach per-user metadata. Returns new objects; inputs stay untouched.
 function decorate(candidate, ctx, deps) {
   var out = {}
   for (var k in candidate) out[k] = candidate[k]
@@ -142,7 +141,7 @@ function fallbackRows(query) {
   return FALLBACKS.map(function(f) {
     return {
       candidate: {
-        id: f.id, type: "command", kind: "fallback", title: f.title, subtitle: query,
+        id: f.id, type: "command", kind: "fallback", title: f.title, subtitle: f.subtitle || query,
         typeLabel: "Fallback", glyph: f.icon, url: f.url, rootSearch: { when: "searching" }
       },
       record: null
@@ -150,9 +149,53 @@ function fallbackRows(query) {
   })
 }
 
-// Sections for the root view (SPEC §7.2):
-//   empty query: Favorites, Suggestions, Commands, Applications
-//   query:       Results, Use "<q>" with…
+// The inline Calculator row (SPEC §7.2 "Calculator" section) for a
+// Calculator.evaluate() result. Not a stored candidate: its actions re-run
+// the query.
+var CALCULATOR_ID = "calculator:result"
+
+function calculatorCandidate(calc) {
+  return {
+    id: CALCULATOR_ID, type: "command", kind: "calculator",
+    title: calc.result, subtitle: calc.input, typeLabel: "Calculator",
+    calcKind: calc.kind, calcInput: calc.input, calcResult: calc.result,
+    calcInputCaption: calc.inputCaption || "", calcResultCaption: calc.resultCaption || "",
+    rootSearch: { when: "searching" }
+  }
+}
+
+// One saved calculation in Calculator History.
+function historyCandidate(entry, nowMs) {
+  return {
+    id: "calculator-history:" + entry.id, type: "command", kind: "calculator-history",
+    title: entry.result, subtitle: entry.query, typeLabel: relativeTime(entry.createdAt, nowMs),
+    glyph: "\uf1ec", historyId: entry.id, rootSearch: { when: "always" }   // nf-fa-calculator
+  }
+}
+
+function relativeTime(ms, nowMs) {
+  var s = Math.max(0, Math.round((nowMs - ms) / 1000))
+  if (s < 60) return "Just now"
+  if (s < 3600) return Math.floor(s / 60) + " min ago"
+  if (s < 86400) return Math.floor(s / 3600) + " h ago"
+  var d = Math.floor(s / 86400)
+  return d === 1 ? "Yesterday" : d + " days ago"
+}
+
+// Calculator History (ref 04 App. A calculator.history): newest first,
+// filtered by the query, split into Today and Earlier. [I]
+function historySections(history, query, nowMs, filter) {
+  var list = filter(history, query)
+  if (list.length === 0) return []
+  var midnight = new Date(nowMs); midnight.setHours(0, 0, 0, 0)
+  var todays = [], older = []
+  for (var i = 0; i < list.length; i++) (list[i].createdAt >= midnight.getTime() ? todays : older).push({ candidate: historyCandidate(list[i], nowMs), record: null })
+  var out = []
+  if (todays.length) out.push({ id: "history-today", title: "Today", rows: todays })
+  if (older.length) out.push({ id: "history-older", title: "Earlier", rows: older })
+  return out
+}
+
 function rootSections(candidates, query, ctx, deps) {
   var q = String(query || "").trim()
   var decorated = []
@@ -166,6 +209,7 @@ function rootSections(candidates, query, ctx, deps) {
     var searchable = decorated.filter(function(c) { return c.rootSearch.when !== "empty" })
     var results = deps.Ranker.rank(searchable, q, opts)
     var sections = []
+    if (ctx.calculation) sections.push({ id: "calculator", title: "Calculator", rows: [{ candidate: calculatorCandidate(ctx.calculation), record: null }] })
     if (results.length > 0) sections.push({ id: "results", title: "Results", rows: results })
     sections.push({ id: "fallback-commands", title: "Use “" + q + "” with…", rows: fallbackRows(q) })
     return sections
@@ -193,8 +237,6 @@ function rootSections(candidates, query, ctx, deps) {
   return out
 }
 
-// A pushed Omarchy submenu: its visible children in menu order, or, while
-// searching, every descendant ranked (the Omarchy menu searches the same way).
 function submenuSections(candidates, menuId, query, ctx, deps) {
   var prefix = "omarchy:" + menuId + "."
   var q = String(query || "").trim()
@@ -206,15 +248,28 @@ function submenuSections(candidates, menuId, query, ctx, deps) {
     if (!q && rest.indexOf(".") >= 0) continue
     inside.push(decorate(c, ctx, deps))
   }
-  // Unfiltered children all share the breadcrumb of the open menu; drop it.
   if (!q) return inside.length ? [{ id: "menu", title: "", rows: inside.map(function(c) { c.subtitle = ""; return { candidate: c, record: null } }) }] : []
   var ranked = deps.Ranker.rank(inside, q, rankOptions(ctx))
   return ranked.length ? [{ id: "results", title: "Results", rows: ranked }] : []
 }
 
-// Actions for a row (SPEC §10.2 action panel, §10.3 shortcuts). The first is
-// primary (↵), the second secondary (Ctrl ↵).
 function actionsFor(candidate) {
+  if (candidate.kind === "calculator" || candidate.kind === "calculator-history") {
+    // ↵ copies, Ctrl ↵ pastes (SPEC §8 Calculator) [O]; delete keys are
+    // the Windows `clear` shortcuts (ref 04 §2.8).
+    var calc = [
+      { id: "copy-answer", title: "Copy Answer", shortcut: "↵", section: "primary", icon: "" },
+      { id: "paste-answer", title: "Paste Answer", shortcut: "Ctrl ↵", section: "primary", icon: "" },
+      { id: "copy-question-answer", title: "Copy Question and Answer", shortcut: "Ctrl Shift C", section: "copy", icon: "" }
+    ]
+    if (candidate.kind === "calculator") {
+      calc.push({ id: "open-history", title: "Open Calculator History", shortcut: "", section: "configure", icon: "" })
+    } else {
+      calc.push({ id: "delete-entry", title: "Delete Entry", shortcut: "Ctrl D", section: "delete", icon: "" })
+      calc.push({ id: "delete-all-entries", title: "Delete All Entries", shortcut: "Ctrl Shift D", section: "delete", icon: "" })
+    }
+    return calc
+  }
   var primary
   var list = []
   switch (candidate.kind) {
@@ -250,7 +305,6 @@ function actionsFor(candidate) {
   return list
 }
 
-// Favourite ordering: returns the new {id: order} map for an action.
 function reorderFavorites(commands, id, action) {
   var favs = []
   for (var key in commands) if (typeof commands[key].favoriteOrder === "number") favs.push({ id: key, order: commands[key].favoriteOrder })
@@ -280,6 +334,10 @@ if (typeof module !== "undefined") {
     menuCandidate: menuCandidate,
     menuCandidates: menuCandidates,
     builtinCandidate: builtinCandidate,
+    CALCULATOR_ID: CALCULATOR_ID,
+    calculatorCandidate: calculatorCandidate,
+    historyCandidate: historyCandidate,
+    historySections: historySections,
     decorate: decorate,
     rootSections: rootSections,
     submenuSections: submenuSections,
